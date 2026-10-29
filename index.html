@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Придержи дверь</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#2a2622">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+/* Палитра UI — одно место; canvas читает её через getComputedStyle (PROTO-BASE §9). Арт сцены — константа ART в коде. */
+:root{
+  --bg:#2a2622; --frame:#3a332d; --ink:#fff7ee; --muted:#cbbfb2;
+  --accent:#ffb347; --off:#5a5048; --danger:#ff6b5e; --cold:#7cc4ff; --warm:#ff9f43;
+  --frame-w:430px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:16px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif;
+  overflow:hidden;overscroll-behavior:none;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent}
+#frame{position:relative;width:min(100vw,var(--frame-w));height:100dvh;height:100svh;margin:0 auto;background:var(--frame);
+  display:flex;flex-direction:column;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+header{display:flex;align-items:center;gap:10px;padding:8px 12px;min-height:46px}
+header b{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+#hearts{color:var(--danger);font-size:20px;letter-spacing:1px;white-space:nowrap}
+#hearts i{font-style:normal;color:var(--off)}
+#warm{position:relative;width:64px;height:12px;border-radius:6px;background:var(--off);overflow:hidden;flex:none}
+#warm div{position:absolute;left:0;top:0;bottom:0;background:var(--warm);border-radius:6px}
+#warm.cold div{background:var(--cold)}
+#count{color:var(--muted);font-size:14px;white-space:nowrap}
+header button{padding:6px 8px;background:transparent;font-size:18px}
+#game{flex:1;position:relative;touch-action:none;min-height:0}
+#game canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+footer{display:flex;gap:8px;justify-content:center;padding:8px 12px calc(8px + env(safe-area-inset-bottom))}
+button{font:inherit;color:var(--ink);background:var(--off);border:0;border-radius:12px;padding:10px 16px;cursor:pointer}
+button.primary{background:var(--accent);color:#2a1d10;font-weight:700}
+#overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(20,14,10,.55);padding:20px}
+#overlay.show{display:flex}
+.card{background:var(--frame);border-radius:18px;padding:22px;max-width:350px;width:100%;text-align:center;
+  animation:pop .18s ease-out} /* стартует с видимого состояния, не с opacity:0 (§9) */
+@keyframes pop{from{transform:scale(.96)}to{transform:scale(1)}}
+.card h2{margin:0 0 8px} .card p{color:var(--muted);margin:0 0 16px}
+.card .stars{font-size:34px;color:var(--accent);letter-spacing:4px;margin:4px 0 10px}
+.levels{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:0 0 14px}
+.levels button{padding:10px 4px;font-size:14px;line-height:1.2}
+.levels button small{display:block;color:var(--accent);font-size:12px;min-height:14px}
+#toast{position:absolute;left:50%;top:58px;transform:translateX(-50%);background:rgba(30,22,16,.9);padding:9px 14px;border-radius:12px;
+  pointer-events:none;opacity:.98;transition:opacity .25s;width:max-content;max-width:88%;text-align:center;font-size:15px}
+#toast.hide{opacity:0}
+@media (prefers-reduced-motion: reduce){ .card{animation:none} #toast{transition:none} }
+</style>
+</head>
+<body>
+<div id="frame">
+  <header>
+    <b id="hud-level">Уровень 1</b>
+    <span id="hearts" aria-label="сердца">♥♥♥</span>
+    <div id="warm" aria-label="тепло в подъезде"><div></div></div>
+    <span id="count">0/0</span>
+    <button id="btn-mute" aria-label="звук">🔊</button>
+  </header>
+  <div id="game"><canvas id="cv"></canvas></div>
+  <footer>
+    <button id="btn-reset">Заново</button>
+    <button id="btn-menu">Меню</button>
+  </footer>
+  <div id="overlay"><div class="card" id="card"></div></div>
+  <div id="toast" class="hide"></div>
+</div>
+<script>
+'use strict';
+/* ЯДРО */
+// ---------------------------------------------------------------------------
+// «Придержи дверь» — вид сверху на вход в подъезд. Дверь висит на петлях у левого косяка и
+// открывается внутрь. Игрок держит её пальцем (угол), отпустил — доводчик закрывает.
+// Жильцы ходят сами по маршрутам. Дверь не проходит сквозь людей: удар быстрее PINCH_SPEED —
+// «прищемил» (−сердце), медленное движение рукой мягко отодвигает человека.
+// Сердца теряются ещё за долгое ожидание у мешающей двери и за выстуженный подъезд.
+// Контракт для sim.mjs/test.mjs — EXPORTS в core-load.mjs.
+// ---------------------------------------------------------------------------
+const CFG = {
+  STEP: 1 / 120,          // шаг симуляции, с (фиксированный — исключение «физика», PROTO-BASE §4)
+  MAX_SUBSTEPS: 30,       // предел подшагов за кадр (защита от spiral-of-death)
+  W: 320, H: 640,         // мир в виртуальных юнитах; экран — только масштаб
+  VIEW_Y0: 60,            // камера: видимая часть мира по вертикали от VIEW_Y0 до H
+  WALL_Y: 400,            // внутренняя грань фасадной стены (выше — подъезд, ниже — улица)
+  WALL_T: 20,             // толщина стены
+  JAMB_L: 100,            // левый косяк, на нём петли
+  JAMB_R: 210,            // правый косяк; ширина проёма = длина полотна
+  DOOR_HALF: 5,           // полутолщина полотна
+  DOOR_MAX: 150,          // предел открытия, градусы
+  DRAG_DEG: 0.8,          // градусов на юнит вертикального свайпа (вверх — шире)
+  HAND_GAIN: 12,          // 1/с: как быстро дверь догоняет палец
+  HAND_SPEED: 320,        // град/с: предел скорости рукой
+  CLOSER_ACC: 700,        // град/с²: разгон доводчика
+  CLOSER_SPEED: 220,      // град/с: предельная скорость доводчика
+  SLAM_SPEED: 60,         // град/с: закрылась быстрее — «хлоп» (звук, пыль)
+  PINCH_SPEED: 110,       // град/с: удар по человеку быстрее этого = «прищемил»
+  BOUNCE: 6,              // град: отскок двери после удара
+  STUN: 0.8,              // с: человек приходит в себя после удара
+  PATIENCE: 6,            // с ожидания у мешающей двери до потери сердца
+  PATIENCE_RECOVER: 0.5,  // с/с: ожидание забывается на ходу
+  HEARTS: 3,              // сердец на уровень; сколько осталось в конце — столько звёзд
+  WARM_DRAIN: 0.06,       // доля тепла в секунду при двери, открытой на 90° (пропорционально углу)
+  WARM_GAIN: 0.16,        // доля тепла в секунду, которая возвращается, пока дверь закрыта
+  WARM_RESET: 0.5,        // после «Дует!» тепло возвращается к этой доле
+  OPEN_EPS: 3,            // град: меньше — дверь считается закрытой
+  YIELD: 1.5,             // с: столько ждёт встречный у тамбура, прежде чем его пропустят первым
+  GHOST_AFTER: 1.2,       // с взаимной блокировки людей, после которой один проходит «насквозь»
+  GHOST_TIME: 0.8,        // с такого прохода
+  ZONE: { x0: 70, x1: 240, y0: 285, y1: 490 },    // тамбур у проёма: встречные в нём не расходятся
+  LIMIT_PAD: 60,          // с после последнего жильца — потолок длительности уровня
+};
+
+// Детерминированный генератор случайных чисел (PROTO-BASE §5). Math.random() не используется.
+function mulberry32(seed){
+  let a = seed >>> 0;
+  return function(){
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Кто ходит. Каждый — капсула: r — полуширина, len — длина (0 — просто человек), speed — юнитов в секунду.
+const TYPES = {
+  walker:   { r: 11, len: 0,   speed: 68,  name: 'сосед' },
+  granny:   { r: 12, len: 0,   speed: 40,  name: 'бабушка' },
+  courier:  { r: 12, len: 0,   speed: 105, name: 'курьер' },
+  bags:     { r: 17, len: 0,   speed: 46,  name: 'с пакетами' },
+  stroller: { r: 14, len: 38,  speed: 50,  name: 'коляска' },
+  bike:     { r: 9,  len: 60,  speed: 60,  name: 'велосипед' },
+  sofa:     { r: 19, len: 118, speed: 40,  name: 'диван' },
+};
+
+// Маршруты: pts[0] — появление, pts[1] — ворота тамбура (там ждут встречных; вне сектора двери), дальше путь.
+// Третье число в точке — остановка, с (почтовые ящики у левой стены).
+const ROUTES = {
+  inStairs:  { dir: 'in',  pts: [[182, 660], [182, 505], [178, 335], [196, 268], [248, 170], [274, 84]] },
+  inLift:    { dir: 'in',  pts: [[162, 660], [162, 505], [162, 335], [120, 262], [72, 170], [50, 84]] },
+  inMail:    { dir: 'in',  pts: [[155, 660], [155, 505], [165, 320], [165, 262], [40, 288], [36, 366, 1.4], [56, 250], [62, 170], [50, 84]] },
+  outStairs: { dir: 'out', pts: [[274, 84], [252, 248], [172, 335], [168, 480], [198, 660]] },
+  outLift:   { dir: 'out', pts: [[50, 84], [215, 240], [172, 335], [165, 480], [132, 660]] },
+};
+
+// Уровни — декларативная таблица: кто, когда и куда идёт. Случайности в уровнях нет.
+const LEVELS = [
+  { n: 1, title: 'Придержи', hint: 'Зажми палец и веди вверх — дверь откроется. Отпустишь — доводчик захлопнет.',
+    spawns: [ { t: 0.6, type: 'walker', route: 'inStairs' }, { t: 6.0, type: 'walker', route: 'inStairs' },
+              { t: 11.0, type: 'walker', route: 'inLift' } ] },
+  { n: 2, title: 'Навстречу', hint: 'Изнутри тоже выходят. Открой заранее: дверь бьёт того, кто стоит за ней.',
+    spawns: [ { t: 0.6, type: 'walker', route: 'outStairs' }, { t: 3.5, type: 'walker', route: 'inStairs' },
+              { t: 6.0, type: 'walker', route: 'outLift' }, { t: 8.0, type: 'bags', route: 'inStairs' },
+              { t: 10.0, type: 'walker', route: 'outStairs' }, { t: 12.0, type: 'walker', route: 'inLift' } ] },
+  { n: 3, title: 'Коляска', hint: 'Длинное проходит дольше. Не отпускай, пока не проехал хвост.',
+    spawns: [ { t: 0.6, type: 'stroller', route: 'inLift' }, { t: 2.5, type: 'granny', route: 'outStairs' },
+              { t: 6.0, type: 'walker', route: 'inStairs' }, { t: 8.0, type: 'bike', route: 'outLift' },
+              { t: 10.0, type: 'courier', route: 'inStairs' }, { t: 12.0, type: 'bags', route: 'inLift' },
+              { t: 14.0, type: 'walker', route: 'outStairs' } ] },
+  { n: 4, title: 'Почта', hint: 'У ящиков слева стоят люди. Распахнёшь слишком широко — заденешь.',
+    spawns: [ { t: 0.6, type: 'walker', route: 'inMail' }, { t: 2.5, type: 'bike', route: 'outStairs' },
+              { t: 5.0, type: 'bags', route: 'inMail' }, { t: 7.0, type: 'walker', route: 'inLift' },
+              { t: 9.0, type: 'stroller', route: 'inStairs' }, { t: 11.0, type: 'walker', route: 'outLift' },
+              { t: 13.0, type: 'walker', route: 'inMail' }, { t: 15.0, type: 'courier', route: 'outStairs' } ] },
+  { n: 5, title: 'Диван', hint: 'Диван разворачивается к лифту. Застрял — открой шире.',
+    spawns: [ { t: 0.6, type: 'sofa', route: 'inLift' }, { t: 4.0, type: 'walker', route: 'outStairs' },
+              { t: 7.0, type: 'walker', route: 'inMail' }, { t: 10.0, type: 'granny', route: 'outLift' },
+              { t: 13.0, type: 'bags', route: 'inStairs' }, { t: 15.0, type: 'walker', route: 'outStairs' } ] },
+  { n: 6, title: 'Час пик', hint: 'Все сразу. Береги тепло и никого не прищеми.',
+    spawns: [ { t: 0.6, type: 'walker', route: 'inStairs' }, { t: 2.0, type: 'walker', route: 'outLift' },
+              { t: 4.0, type: 'bags', route: 'inLift' }, { t: 5.5, type: 'courier', route: 'inStairs' },
+              { t: 7.0, type: 'granny', route: 'outStairs' }, { t: 9.0, type: 'stroller', route: 'inLift' },
+              { t: 11.0, type: 'bike', route: 'outStairs' }, { t: 13.0, type: 'walker', route: 'inMail' },
+              { t: 15.0, type: 'walker', route: 'outLift' }, { t: 17.0, type: 'bags', route: 'inStairs' },
+              { t: 19.0, type: 'courier', route: 'outStairs' }, { t: 21.0, type: 'walker', route: 'inLift' } ] },
+];
+function levelLimit(li){ const sp = LEVELS[li].spawns; return sp[sp.length - 1].t + CFG.LIMIT_PAD; }
+
+// --- геометрия ---
+function clamp(v, a, b){ return v < a ? a : v > b ? b : v; }
+// Минимальное расстояние между отрезками P1Q1 и P2Q2 (Ericson, Real-Time Collision Detection 5.1.9).
+function segDist(p1x, p1y, q1x, q1y, p2x, p2y, q2x, q2y){
+  const d1x = q1x - p1x, d1y = q1y - p1y, d2x = q2x - p2x, d2y = q2y - p2y, rx = p1x - p2x, ry = p1y - p2y;
+  const a = d1x * d1x + d1y * d1y, e = d2x * d2x + d2y * d2y, f = d2x * rx + d2y * ry, EPS = 1e-9;
+  let s = 0, t = 0;
+  if (a <= EPS && e <= EPS) return Math.hypot(rx, ry);
+  if (a <= EPS){ t = clamp(f / e, 0, 1); }
+  else {
+    const c = d1x * rx + d1y * ry;
+    if (e <= EPS){ s = clamp(-c / a, 0, 1); }
+    else {
+      const b = d1x * d2x + d1y * d2y, den = a * e - b * b;
+      s = den > EPS ? clamp((b * f - c * e) / den, 0, 1) : 0;
+      t = (b * s + f) / e;
+      if (t < 0){ t = 0; s = clamp(-c / a, 0, 1); }
+      else if (t > 1){ t = 1; s = clamp((b - c) / a, 0, 1); }
+    }
+  }
+  return Math.hypot(p1x + d1x * s - p2x - d2x * t, p1y + d1y * s - p2y - d2y * t);
+}
+const HINGE = { x: CFG.JAMB_L, y: CFG.WALL_Y + CFG.WALL_T / 2 };     // петли
+const DOOR_LEN = CFG.JAMB_R - CFG.JAMB_L;                            // длина полотна = ширина проёма
+const DOOR_C = { x: (CFG.JAMB_L + CFG.JAMB_R) / 2, y: HINGE.y };     // середина проёма
+// Стены, в которые нельзя вдавить человека: фасад слева и справа от проёма, края мира.
+const WALLS = [[0, CFG.WALL_Y, CFG.JAMB_L, CFG.WALL_Y + CFG.WALL_T], [CFG.JAMB_R, CFG.WALL_Y, CFG.W, CFG.WALL_Y + CFG.WALL_T],
+  [-60, -300, 0, 1000], [CFG.W, -300, CFG.W + 60, 1000]];
+
+function doorEnd(theta){ const r = theta * Math.PI / 180; return { x: HINGE.x + DOOR_LEN * Math.cos(r), y: HINGE.y - DOOR_LEN * Math.sin(r) }; }
+function doorDist(theta, a){ const e = doorEnd(theta); return segDist(HINGE.x, HINGE.y, e.x, e.y, a.px, a.py, a.qx, a.qy); }
+function capDist(a, b){ return segDist(a.px, a.py, a.qx, a.qy, b.px, b.py, b.qx, b.qy); }
+function rectDist(a, R){
+  const [x0, y0, x1, y1] = R, inside = (x, y) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
+  if (inside(a.px, a.py) || inside(a.qx, a.qy)) return 0;
+  return Math.min(segDist(a.px, a.py, a.qx, a.qy, x0, y0, x1, y0), segDist(a.px, a.py, a.qx, a.qy, x1, y0, x1, y1),
+                  segDist(a.px, a.py, a.qx, a.qy, x1, y1, x0, y1), segDist(a.px, a.py, a.qx, a.qy, x0, y1, x0, y0));
+}
+function hitsWall(a){ return WALLS.some(R => rectDist(a, R) < a.T.r - 0.5); }
+function outsideZone(a){
+  const Z = CFG.ZONE, r = a.T.r, out = (x, y) => x < Z.x0 - r || x > Z.x1 + r || y < Z.y0 - r || y > Z.y1 + r;
+  return out(a.px, a.py) && out(a.qx, a.qy);
+}
+
+// --- состояние ---
+function createState(li){
+  return {
+    li, t: 0, door: { theta: 0, omega: 0, held: false },
+    agents: [], queue: LEVELS[li].spawns.map((sp, i) => ({ ...sp, id: i })).sort((a, b) => a.t - b.t),
+    total: LEVELS[li].spawns.length, passed: 0, hearts: CFG.HEARTS, warm: 1, over: null, why: '', lastHurt: '', events: [],
+    stats: { pinches: 0, impatient: 0, drafts: 0, slams: 0, grabs: 0, pushes: 0, heldTime: 0, openTime: 0 },
+  };
+}
+function ev(s, kind, data){ s.events.push(Object.assign({ t: s.t, kind }, data)); }
+function hurt(s, reason, a){ s.hearts = Math.max(0, s.hearts - 1); s.lastHurt = reason; ev(s, 'heart', { reason, id: a ? a.id : -1 }); }
+
+function spawnDue(s){
+  while (s.queue.length && s.queue[0].t <= s.t){
+    const sp = s.queue[0], T = TYPES[sp.type], R = ROUTES[sp.route];
+    const [x0, y0] = R.pts[0], [x1, y1] = R.pts[1], l = Math.hypot(x1 - x0, y1 - y0);
+    const a = { id: sp.id, type: sp.type, T, route: sp.route, R, wp: 1, state: 'walk',
+      px: x0, py: y0, qx: x0 - (x1 - x0) / l * T.len, qy: y0 - (y1 - y0) / l * T.len, hx: (x1 - x0) / l, hy: (y1 - y0) / l,
+      wait: 0, blockA: 0, blockedDoor: false, ghostUntil: -1, stunUntil: -1, stopUntil: -1, gateSince: 0, hits: 0, walked: 0, done: false };
+    if (s.agents.some(c => capDist(a, c) < T.r + c.T.r + 2)) break;      // место появления занято — подождём
+    s.queue.shift(); s.agents.push(a); ev(s, 'spawn', { id: a.id, type: a.type });
+  }
+}
+
+// Дверь: рука ведёт к target (не быстрее HAND_SPEED), без руки — доводчик к нулю. Упёрлась в человека:
+// быстро — удар и отскок, медленно рукой — мягко отодвигает, медленно доводчиком — просто ложится на него.
+function stepDoor(s, inp, dt){
+  const D = s.door;
+  if (inp.hold){
+    if (!D.held){ D.held = true; s.stats.grabs++; ev(s, 'grab'); }
+    D.omega = clamp((clamp(inp.target, 0, CFG.DOOR_MAX) - D.theta) * CFG.HAND_GAIN, -CFG.HAND_SPEED, CFG.HAND_SPEED);
+    s.stats.heldTime += dt;
+  } else {
+    if (D.held){ D.held = false; ev(s, 'release'); }
+    D.omega = D.theta > 0 ? Math.max(-CFG.CLOSER_SPEED, Math.min(D.omega, 0) - CFG.CLOSER_ACC * dt) : 0;
+  }
+  if (D.omega === 0) return;
+  const nt = clamp(D.theta + D.omega * dt, 0, CFG.DOOR_MAX);
+  if (nt === D.theta){ D.omega = 0; return; }
+  let hit = null;
+  for (const a of s.agents){
+    const d1 = doorDist(nt, a);
+    if (d1 < a.T.r + CFG.DOOR_HALF && d1 < doorDist(D.theta, a) - 1e-6){ hit = a; break; }
+  }
+  if (!hit){
+    if (nt === 0){ if (!D.held && -D.omega >= CFG.SLAM_SPEED){ s.stats.slams++; ev(s, 'slam', { speed: -D.omega }); } D.omega = 0; }
+    D.theta = nt; return;
+  }
+  const speed = Math.abs(D.omega), dir = Math.sign(D.omega);
+  if (speed >= CFG.PINCH_SPEED && s.t >= hit.stunUntil){
+    hit.stunUntil = s.t + CFG.STUN; hit.hits++; s.stats.pinches++;
+    ev(s, 'pinch', { id: hit.id, type: hit.type, x: hit.px, y: hit.py, speed, by: D.held ? 'hand' : 'closer' });
+    hurt(s, 'pinch', hit);
+    D.theta = clamp(D.theta - dir * CFG.BOUNCE, 0, CFG.DOOR_MAX); D.omega = 0;
+  } else if (D.held && pushAgent(s, hit, nt, dir)){ D.theta = nt; s.stats.pushes++; }
+  else D.omega = 0;
+}
+function pushAgent(s, a, nt, dir){
+  const r = nt * Math.PI / 180, nx = -Math.sin(r) * dir, ny = -Math.cos(r) * dir, need = a.T.r + CFG.DOOR_HALF + 0.5;
+  let k = need - doorDist(nt, a) + 0.5;
+  for (let i = 0; i < 4; i++){
+    const b = { px: a.px + nx * k, py: a.py + ny * k, qx: a.qx + nx * k, qy: a.qy + ny * k, T: a.T };
+    if (doorDist(nt, b) >= need){
+      if (hitsWall(b) || s.agents.some(c => c !== a && capDist(b, c) < b.T.r + c.T.r && capDist(b, c) < capDist(a, c))) return false;
+      a.px = b.px; a.py = b.py; a.qx = b.qx; a.qy = b.qy; return true;
+    }
+    k *= 1.8;
+  }
+  return false;
+}
+
+// Встречные в тамбуре не расходятся: ждём у ворот, пока идёт поток с той стороны. Кто ждёт дольше YIELD — тот первый.
+function gateOpen(s, a){
+  for (const c of s.agents){
+    if (c === a || c.done || c.R.dir === a.R.dir) continue;
+    if (c.state === 'transit') return false;
+    if (c.state === 'gate' && c.gateSince < a.gateSince && s.t - c.gateSince > CFG.YIELD) return false;
+  }
+  return true;
+}
+function arrive(s, a){
+  const W = a.R.pts[a.wp];
+  if (W[2]) a.stopUntil = s.t + W[2];
+  if (a.wp === 1){ a.state = 'gate'; a.gateSince = s.t; return; }
+  a.wp++;
+  if (a.wp >= a.R.pts.length){ a.done = true; s.passed++; ev(s, 'pass', { id: a.id, type: a.type, x: a.px, y: a.py }); }
+}
+function stepAgents(s, dt){
+  const th = s.door.theta;
+  for (const a of s.agents){
+    if (a.done || s.t < a.stunUntil || s.t < a.stopUntil) continue;
+    if (a.state === 'gate'){
+      if (!gateOpen(s, a)) continue;
+      a.state = 'transit'; a.wp = 2;
+    }
+    const W = a.R.pts[a.wp], dx = W[0] - a.px, dy = W[1] - a.py, dist = Math.hypot(dx, dy);
+    if (dist < 0.5){ arrive(s, a); continue; }
+    const len = Math.min(a.T.speed * dt, dist), px = a.px + dx / dist * len, py = a.py + dy / dist * len;
+    let qx = px, qy = py;
+    if (a.T.len > 0){ const ex = px - a.qx, ey = py - a.qy, el = Math.hypot(ex, ey) || 1; qx = px - ex / el * a.T.len; qy = py - ey / el * a.T.len; }
+    const nb = { px, py, qx, qy, T: a.T };
+    // дверь мешает — ждём, терпение тает
+    const dn = doorDist(th, nb);
+    if (dn < a.T.r + CFG.DOOR_HALF && dn < doorDist(th, a)){
+      a.blockedDoor = true; a.wait += dt;
+      if (a.wait >= CFG.PATIENCE){ a.wait = 0; s.stats.impatient++; ev(s, 'impatient', { id: a.id, type: a.type }); hurt(s, 'impatient', a); }
+      continue;
+    }
+    a.blockedDoor = false;
+    // люди мешают — ждём без потери терпения; долгая взаимная блокировка — проходим насквозь
+    if (s.t >= a.ghostUntil){
+      let blocked = false;
+      for (const c of s.agents){
+        if (c === a || c.done || s.t < c.ghostUntil) continue;
+        const dd = capDist(nb, c);
+        if (dd < a.T.r + c.T.r && dd < capDist(a, c)){ blocked = true; break; }
+      }
+      if (blocked){ a.blockA += dt; if (a.blockA > CFG.GHOST_AFTER){ a.ghostUntil = s.t + CFG.GHOST_TIME; a.blockA = 0; } continue; }
+    }
+    a.blockA = 0; a.wait = Math.max(0, a.wait - dt * CFG.PATIENCE_RECOVER);
+    a.hx = dx / dist; a.hy = dy / dist; a.walked += len;
+    a.px = px; a.py = py; a.qx = qx; a.qy = qy;
+    if (len >= dist - 1e-6) arrive(s, a);
+    if (a.state === 'transit' && a.wp >= 3 && outsideZone(a)) a.state = 'leave';
+  }
+  if (s.agents.some(a => a.done)) s.agents = s.agents.filter(a => !a.done);
+}
+function stepWarm(s, dt){
+  const th = s.door.theta;
+  if (th > CFG.OPEN_EPS){ s.warm -= CFG.WARM_DRAIN * (th / 90) * dt; s.stats.openTime += dt; }
+  else s.warm = Math.min(1, s.warm + CFG.WARM_GAIN * dt);
+  if (s.warm <= 0){ s.warm = CFG.WARM_RESET; s.stats.drafts++; ev(s, 'draft'); hurt(s, 'draft'); }
+}
+// Один шаг мира. inp = { hold, target }: держит ли палец дверь и к какому углу её ведёт.
+function step(s, inp, dt){
+  if (s.over) return s;
+  s.t += dt;
+  spawnDue(s);
+  stepDoor(s, inp, dt);
+  stepAgents(s, dt);
+  stepWarm(s, dt);
+  if (s.hearts <= 0){ s.over = 'lose'; s.why = s.lastHurt; ev(s, 'lose', { why: s.why }); }
+  else if (s.passed >= s.total){ s.over = 'win'; ev(s, 'win', { hearts: s.hearts }); }
+  else if (s.t > levelLimit(s.li)){ s.over = 'lose'; s.why = 'timeout'; ev(s, 'lose', { why: s.why }); }
+  return s;
+}
+
+// --- боты (PROTO-BASE §6): раз в period секунд смотрят на мир и возвращают ввод { hold, target } ---
+// Нужные углы сняты `node sim.mjs needs`: прямо проходят от ~60°, кто сворачивает к лифту (к петлям) — от ~85°,
+// диван к лифту — от ~95°, у почтовых ящиков дверь шире ~110° бьёт стоящего.
+const BOT = {
+  PERIOD: 0.05,          // с между решениями сильного бота (20 раз в секунду)
+  NOVICE_PERIOD: 0.25,   // новичок реагирует медленнее
+  LEAD_IN: 45,           // юнитов от наружной грани: входящий вот-вот упрётся — пора открывать
+  LEAD_OUT: 130,         // юнитов от середины проёма: выходящему пора открывать заранее
+  OPEN: 65,              // угол для прямого прохода
+  LIFT: 92,              // к лифту сворачивают за петли — шире
+  SOFA: 105,             // диван к лифту
+  MAIL_CAP: 105,         // пока кто-то у ящиков — не шире
+  NOVICE_ANGLE: 90,      // новичок всегда открывает на 90°
+  NOTICE: 110,           // новичок замечает жильца в этом радиусе от проёма
+  CASUAL_PERIOD: 0.3,    // «обычный игрок» реагирует раз в 0,3 с
+  CASUAL_ANGLE: 90,      // и открывает на глаз
+  CASUAL_WIDE: 120,      // упёрся кто-то спереди — распахивает
+};
+// Человек в секторе двери — ровно то, что на экране подсвечено красным кольцом.
+function inSweep(a){ return a.py < HINGE.y + a.T.r && segDist(HINGE.x, HINGE.y, HINGE.x, HINGE.y, a.px, a.py, a.qx, a.qy) < DOOR_LEN + a.T.r + CFG.DOOR_HALF; }
+// Где жилец относительно петель (градусы). Капсула — по ближнему к проёму концу: хвост дивана спереди, нос уже за дверью.
+function agentAngle(a){ const f = (x, y) => Math.atan2(HINGE.y - y, x - HINGE.x) * 180 / Math.PI; return Math.min(f(a.px, a.py), f(a.qx, a.qy)); }
+function atMail(a){ return a.route === 'inMail' && a.wp >= 4 && a.wp <= 6; }
+function wantsDoor(a){
+  if (a.done || a.state === 'leave') return false;
+  if (a.R.dir === 'in') return (a.state === 'gate' || a.state === 'transit') && a.py - CFG.WALL_Y - CFG.WALL_T < BOT.LEAD_IN;
+  return a.state === 'transit' && Math.hypot(a.px - DOOR_C.x, a.py - DOOR_C.y) < BOT.LEAD_OUT;
+}
+function needAngle(a){ return a.type === 'sofa' ? BOT.SOFA : a.route === 'inLift' ? BOT.LIFT : BOT.OPEN; }
+function angleFree(s, th, m){ for (const a of s.agents) if (doorDist(th, a) < a.T.r + CFG.DOOR_HALF + m) return false; return true; }
+function pathFree(s, from, to, m){
+  const d = to > from ? 2 : -2;
+  for (let t = from; d > 0 ? t < to : t > to; t += d) if (!angleFree(s, t, m)) return false;
+  return angleFree(s, to, m);
+}
+const BOTS = {
+  none(){ return { hold: false, target: 0 }; },
+  hold90(){ return { hold: true, target: 90 }; },
+  holdMax(){ return { hold: true, target: CFG.DOOR_MAX }; },
+  random(s, m){
+    if (s.t >= (m.until || 0)){ m.until = s.t + 0.3 + m.rnd() * 1.2; m.inp = m.rnd() < 0.5 ? { hold: false, target: 0 } : { hold: true, target: m.rnd() * CFG.DOOR_MAX }; }
+    return m.inp;
+  },
+  // «Увидел у двери или упёрся кто-то — открыл на 90°, прошёл передом — отпустил»: не смотрит на сектор двери и на хвосты.
+  novice(s){
+    const coming = s.agents.some(a => !a.done && (a.blockedDoor || Math.hypot(a.px - DOOR_C.x, a.py - DOOR_C.y) < BOT.NOTICE &&
+      (a.R.dir === 'in' ? a.py > CFG.WALL_Y - 10 : a.py < CFG.WALL_Y + CFG.WALL_T + 10)));
+    return coming ? { hold: true, target: BOT.NOVICE_ANGLE } : { hold: false, target: 0 };
+  },
+  // «Обычный игрок» читает только экран: кто-то подходит — открыл на глаз; упёрся спереди — шире;
+  // пока в секторе есть подсвеченные — держит; никого — отпустил.
+  casual(s, m){
+    const D = s.door; let near = false, wide = false, mail = false, danger = false;
+    for (const a of s.agents){
+      if (a.done) continue;
+      if (wantsDoor(a)) near = true;
+      if (a.blockedDoor && agentAngle(a) < D.theta) wide = true;
+      if (atMail(a)) mail = true;
+      if (inSweep(a) && a.state !== 'leave' || a.blockedDoor) danger = true;
+    }
+    if (wide) m.wideUntil = s.t + 2;
+    if (!near && !(danger && D.theta > CFG.OPEN_EPS)) return { hold: false, target: 0 };
+    let t = s.t < (m.wideUntil || 0) ? BOT.CASUAL_WIDE : BOT.CASUAL_ANGLE;
+    if (mail) t = Math.min(t, BOT.MAIL_CAP);
+    return { hold: true, target: t };
+  },
+  // Сильный: открывает перед самым подходом ровно настолько, насколько нужно; упёрся человек спереди — шире;
+  // у ящиков стоят — не шире MAIL_CAP; на пути двери человек — отодвигает медленно;
+  // отпускает, только когда доводчику никто не попадается.
+  smart(s, m){
+    const D = s.door; m.extra = m.extra || {};
+    let need = 0, cap = CFG.DOOR_MAX;
+    for (const a of s.agents){
+      if (a.done) continue;
+      if (atMail(a)) cap = Math.min(cap, BOT.MAIL_CAP);
+      if (!wantsDoor(a)) continue;
+      if (a.blockedDoor && agentAngle(a) < D.theta) m.extra[a.id] = Math.min(60, (m.extra[a.id] || 0) + 3);
+      need = Math.max(need, needAngle(a) + (m.extra[a.id] || 0));
+    }
+    need = Math.min(need, cap);
+    if (!need) return D.theta <= CFG.OPEN_EPS || pathFree(s, D.theta, 0, 6) ? { hold: false, target: 0 } : { hold: true, target: D.theta };
+    const d = need > D.theta ? 2 : -2; let t = D.theta;
+    while (Math.abs(need - t) > 2 && angleFree(s, t + d, 3)) t += d;
+    if (t === D.theta && Math.abs(need - t) > 2) t = D.theta + d * 2;       // упёрлись в человека — отодвигаем медленно
+    return { hold: true, target: t };
+  },
+};
+// Прогон уровня ботом без экрана: то же ядро, что в игре. Возвращает итог и метрики ощущения.
+function runBot(li, name, seed){
+  const s = createState(li), m = { rnd: mulberry32(seed || 1) };
+  const period = name === 'novice' ? BOT.NOVICE_PERIOD : name === 'casual' ? BOT.CASUAL_PERIOD : BOT.PERIOD;
+  let inp = { hold: false, target: 0 }, next = 0, travel = 0, prev = 0;
+  const log = [];
+  while (!s.over){
+    if (s.t >= next - 1e-9){ inp = BOTS[name](s, m); next = s.t + period; }
+    step(s, inp, CFG.STEP);
+    travel += Math.abs(s.door.theta - prev); prev = s.door.theta;
+    for (const e of s.events) if (e.kind !== 'spawn' && e.kind !== 'grab' && e.kind !== 'release') log.push(e);
+    s.events.length = 0;
+  }
+  return { win: s.over === 'win', stars: s.over === 'win' ? s.hearts : 0, t: s.t, why: s.why, passed: s.passed, total: s.total, travel, log, ...s.stats };
+}
+/* КОНЕЦ ЯДРА */
+
+// ---------------------------------------------------------------------------
+// Оболочка: экраны, ввод, рендер, звук, сейв, дебаг-хук.
+// ---------------------------------------------------------------------------
+const NAME = 'hold-door';
+const T0 = performance.now();
+function log(kind, name, info){            // журнал [game] — одна строка на событие (§11)
+  console.log('[game] ' + JSON.stringify({ t: +((performance.now() - T0) / 1000).toFixed(3), kind, name, info: info === undefined ? '' : String(info) }));
+}
+
+const SAVE_KEY = NAME + '.v1';
+function loadSave(){ try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch (e) { return {}; } }
+function save(){ try { localStorage.setItem(SAVE_KEY, JSON.stringify(G.save)); } catch (e) {} }
+
+const G = {
+  s: null,                       // состояние ядра
+  screen: 'menu',                // menu | game | win | lose | help
+  save: Object.assign({ level: 0, muted: false, best: {} }, loadSave()),
+  input: { hold: false, target: 0 },
+  bot: null, botMem: null, botNext: 0, botInp: { hold: false, target: 0 },   // автоигра (клавиша b, HOLD_DOOR.bot)
+  timeScale: 1, paused: false, acc: 0, last: performance.now(),
+  hitstopUntil: 0,               // стоп-кадр после удара (§4: через время, не через dt)
+  shake: { until: 0, dur: 1, amp: 0 },
+  parts: [],                     // частицы: снег, пыль, яблоки, звёзды — дедлайны в performance.now()
+  bubbles: [],                   // реплики над жильцами
+  grabbed: false,                // был ли захват на этом уровне (подсказка-рука)
+  endAt: 0,                      // когда показать итог уровня
+  lastSnow: 0,
+};
+const FX = mulberry32(2026);      // случайность эффектов — тоже через генератор с сидом (§5)
+
+// Арт сцены — именованные константы (§11). Вид сверху, тёплый подъезд и зимняя улица.
+const ART = {
+  hallA: '#ead9bf', hallB: '#e0cba9', hallWall: '#6e5a4b', street: '#6b7380', sidewalk: '#a7aeb8', curb: '#8c939d', snow: '#f4f8fc',
+  wall: '#4a3d34', wallTop: '#8d7666', door: '#b8743a', doorEdge: '#7a4a22', doorLight: '#d89a5c', handle: '#f1c75a',
+  hinge: '#2b2420', mat: '#7a5040', lift: '#aeb7c2', liftDark: '#7d8792', stairs: '#c9b79d', stairsLine: '#9f8b70',
+  mail: '#5f8a6a', mailSlot: '#2f4a37', sweep: 'rgba(90,60,35,.22)', danger: 'rgba(255,90,80,.85)',
+  skin: '#f2c8a2', coats: ['#4f86f7', '#f26b5b', '#3cbf8a', '#f2b33d', '#9b6bf2', '#ff8cc6', '#45c4d6'],
+  hair: ['#3b2a20', '#7a4a22', '#d9b36c', '#222222', '#a0522d'],
+  granny: '#9b6bf2', scarf: '#e85d8f', courierBox: '#f4c542', bag: '#f5f0e6', bagEdge: '#c9bba5',
+  stroller: '#4fb3a9', strollerHood: '#2f7f78', wheel: '#2d2d2d', bikeFrame: '#e8463c', sofa: '#7d5ba6', sofaCushion: '#9a79c4', sofaEdge: '#5a3f7d',
+  apple: ['#e63b2e', '#f39c12', '#7cc242'], star: '#ffd34d', hint: '#ffb347', bubble: '#ffffff', bubbleInk: '#2a1d10',
+};
+
+// --- звук: WebAudio-синтез без файлов, ленивый старт по первому жесту (§8) ---
+const Audio = {
+  ac: null, noiseBuf: null, creak: null,
+  init(){
+    if (this.ac){ if (this.ac.state === 'suspended') this.ac.resume(); return; }
+    try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { this.ac = null; return; }
+    const n = this.ac.sampleRate, r = mulberry32(99);
+    this.noiseBuf = this.ac.createBuffer(1, n, n);
+    const d = this.noiseBuf.getChannelData(0); for (let i = 0; i < n; i++) d[i] = r() * 2 - 1;
+    // скрип петель: непрерывный шум через узкий полосовой фильтр, громкость и высота — от скорости двери
+    const src = this.ac.createBufferSource(); src.buffer = this.noiseBuf; src.loop = true;
+    const bp = this.ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 22; bp.frequency.value = 420;
+    const g = this.ac.createGain(); g.gain.value = 0;
+    src.connect(bp).connect(g).connect(this.ac.destination); src.start();
+    this.creak = { bp, g };
+  },
+  tone(freq, ms, type, vol, slideTo){
+    if (G.save.muted || !this.ac) return;
+    const o = this.ac.createOscillator(), g = this.ac.createGain(), t = this.ac.currentTime;
+    o.type = type || 'sine'; o.frequency.setValueAtTime(freq, t); if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + ms / 1000);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol || 0.2, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+    o.connect(g).connect(this.ac.destination); o.start(t); o.stop(t + ms / 1000 + 0.03);
+  },
+  noise(ms, freq, vol, kind){
+    if (G.save.muted || !this.ac) return;
+    const t = this.ac.currentTime, src = this.ac.createBufferSource(), f = this.ac.createBiquadFilter(), g = this.ac.createGain();
+    src.buffer = this.noiseBuf; f.type = kind === 'low' ? 'lowpass' : 'bandpass'; f.frequency.value = freq; f.Q.value = kind === 'low' ? 0.7 : 1.4;
+    if (kind === 'sweep'){ f.frequency.setValueAtTime(freq * 0.4, t); f.frequency.exponentialRampToValueAtTime(freq * 1.8, t + ms / 1000); }
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+    src.connect(f).connect(g).connect(this.ac.destination); src.start(t); src.stop(t + ms / 1000 + 0.05);
+  },
+  setCreak(omega){
+    if (!this.creak) return;
+    const v = G.save.muted || G.screen !== 'game' ? 0 : Math.min(1, Math.abs(omega) / 200) * 0.14, t = this.ac.currentTime;
+    this.creak.g.gain.setTargetAtTime(v, t, 0.03); this.creak.bp.frequency.setTargetAtTime(380 + Math.abs(omega) * 2.4, t, 0.05);
+  },
+  slam(){ this.tone(120, 240, 'sine', 0.55, 45); this.noise(130, 500, 0.4, 'low'); log('sound', 'slam'); },
+  pinch(){ this.tone(220, 90, 'sine', 0.5, 110); this.tone(820, 170, 'square', 0.14, 380); log('sound', 'pinch'); },
+  grumble(){ this.tone(190, 150, 'sawtooth', 0.1, 160); setTimeout(() => this.tone(165, 200, 'sawtooth', 0.1, 130), 170); log('sound', 'grumble'); },
+  draft(){ this.noise(800, 900, 0.3, 'sweep'); log('sound', 'draft'); },
+  pass(k){ this.tone(620 * Math.pow(1.122, k), 120, 'triangle', 0.16); log('sound', 'pass'); },
+  grab(){ this.tone(260, 45, 'triangle', 0.08); },
+  win(){ [660, 880, 990, 1320].forEach((f, i) => setTimeout(() => this.tone(f, 170, 'triangle', 0.2), i * 95)); log('sound', 'win'); },
+  lose(){ this.tone(300, 420, 'sawtooth', 0.14, 110); log('sound', 'lose'); },
+};
+function buzz(ms){ try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {} }
+
+// --- экраны: DOM-оверлеи, любой открывается кодом или хешем (§6, §11) ---
+const $ = (id) => document.getElementById(id);
+const WHY = { pinch: 'Трижды прищемил соседей.', impatient: 'Соседи не дождались.', draft: 'Подъезд выстудили.', timeout: 'Время вышло.' };
+function starsText(n){ return '★'.repeat(n) + '☆'.repeat(3 - n); }
+function goto(screen, payload){
+  G.screen = screen; log('screen', screen);
+  const ov = $('overlay'), card = $('card');
+  if (screen === 'game'){ ov.classList.remove('show'); return; }
+  ov.classList.add('show'); $('toast').classList.add('hide'); toastUntil = 0;
+  if (screen === 'menu'){
+    const lv = LEVELS.map((L, i) => `<button data-act="lvl" data-i="${i}">${L.n}. ${L.title}<small>${G.save.best[i] ? starsText(G.save.best[i]) : ''}</small></button>`).join('');
+    card.innerHTML = `<h2>Придержи дверь</h2><p>Пропусти всех жильцов и никого не прищеми.</p>
+      <div class="levels">${lv}</div><button class="primary" data-act="play">Играть: ${G.save.level + 1}</button> <button data-act="help">Как играть</button>`;
+  }
+  if (screen === 'help') card.innerHTML = `<h2>Как играть</h2><p>Зажми палец где угодно и веди вверх — дверь открывается шире, вниз — прикрывается.
+      Отпустишь — доводчик захлопнет её сам.<br><br>Быстрый удар дверью — «прищемил» (−♥). Медленно рукой можно мягко отодвинуть человека.
+      Долго держишь у закрытой двери — соседи злятся (−♥). Открытая дверь выстуживает подъезд (−♥).</p><button class="primary" data-act="menu">Понятно</button>`;
+  if (screen === 'win') card.innerHTML = `<h2>Все прошли!</h2><div class="stars">${starsText(payload || 0)}</div>
+      <p>${G.s ? 'Ударов: ' + G.s.stats.pinches + ' · время ' + G.s.t.toFixed(0) + ' с' : ''}</p><button class="primary" data-act="next">Дальше</button> <button data-act="retry">Ещё раз</button>`;
+  if (screen === 'lose') card.innerHTML = `<h2>Не вышло</h2><p>${WHY[G.s && G.s.why] || 'Сердца кончились.'}</p>
+      <button class="primary" data-act="retry">Ещё раз</button> <button data-act="menu">Меню</button>`;
+}
+$('card').addEventListener('click', (e) => {
+  const el = e.target.closest('button'); const act = el && el.dataset.act; if (!act) return;
+  Audio.init(); log('input', 'button', act);
+  if (act === 'play') startLevel(G.save.level);
+  else if (act === 'lvl') startLevel(+el.dataset.i);
+  else if (act === 'retry') startLevel(G.s ? G.s.li : G.save.level);
+  else if (act === 'next') startLevel(Math.min((G.s ? G.s.li : 0) + 1, LEVELS.length - 1));
+  else if (act === 'help') goto('help');
+  else goto('menu');
+});
+window.addEventListener('hashchange', () => { const h = location.hash.slice(1); if (h === 'game' && !G.s) startLevel(G.save.level); else if (h && h !== G.screen) goto(h); });
+
+let toastUntil = 0;
+function toast(msg, ms){ const t = $('toast'); t.textContent = msg; t.classList.remove('hide'); toastUntil = performance.now() + (ms || 1800); }
+
+function startLevel(li){
+  G.s = createState(li); G.input = { hold: false, target: 0 }; ptr = null;
+  G.parts = []; G.bubbles = []; G.endAt = 0; G.acc = 0; G.grabbed = false; G.hitstopUntil = 0;
+  if (G.bot) G.botMem = { rnd: mulberry32(7) }, G.botNext = 0;
+  log('event', 'level.start', 'level=' + (li + 1) + ' people=' + G.s.total);
+  goto('game'); hud();
+  toast(LEVELS[li].hint, 4200);
+}
+function hud(){
+  const s = G.s;
+  $('hud-level').textContent = s ? (s.li + 1) + '. ' + LEVELS[s.li].title : 'Придержи дверь';
+  const h = s ? s.hearts : CFG.HEARTS;
+  $('hearts').innerHTML = '♥'.repeat(h) + '<i>' + '♥'.repeat(CFG.HEARTS - h) + '</i>';
+  $('count').textContent = s ? s.passed + '/' + s.total : '';
+  const w = s ? s.warm : 1;
+  $('warm').firstElementChild.style.width = Math.round(w * 100) + '%';
+  $('warm').classList.toggle('cold', w < 0.3);
+  $('btn-mute').textContent = G.save.muted ? '🔇' : '🔊';
+}
+function finish(){
+  G.endAt = 0;
+  const s = G.s;
+  if (s.over === 'win'){
+    G.save.best[s.li] = Math.max(G.save.best[s.li] || 0, s.hearts);
+    G.save.level = Math.max(G.save.level, Math.min(s.li + 1, LEVELS.length - 1)); save();
+    log('event', 'reward', 'stars=' + s.hearts);
+    goto('win', s.hearts);
+  } else goto('lose');
+}
+
+// --- события ядра → звук, эффекты, журнал ---
+const PINCH_WORDS = ['Ай!', 'Ой!', 'Эй!', 'Ауч!'], WAIT_WORDS = ['Ну?!', 'Откройте!', 'Сколько ждать?', 'Эй, там!'];
+function agentById(id){ return G.s.agents.find(a => a.id === id); }
+function bubble(id, text, now, x, y){ G.bubbles = G.bubbles.filter(b => b.id !== id || id < 0); G.bubbles.push({ id, text, x, y, born: now, until: now + 1300 }); }
+function shake(now, amp, ms){ G.shake = { until: now + ms, dur: ms, amp }; }
+function burst(e, now){
+  // что разлетается при ударе: у пакетов — фрукты, у остальных — звёздочки
+  const n = e.type === 'bags' ? 6 : 5;
+  for (let i = 0; i < n; i++){
+    const a = FX() * Math.PI * 2, v = 40 + FX() * 90;
+    if (e.type === 'bags') G.parts.push({ kind: 'apple', x: e.x, y: e.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, born: now, until: now + 1600, color: ART.apple[i % 3], r: 3.5 });
+    else G.parts.push({ kind: 'star', x: e.x, y: e.y - 6, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 30, born: now, until: now + 700, r: 4 });
+  }
+}
+function drainEvents(now){
+  const s = G.s;
+  for (const e of s.events){
+    if (e.kind !== 'spawn') log(e.kind === 'grab' || e.kind === 'release' ? 'input' : 'event', e.kind,
+      e.id !== undefined && e.id >= 0 ? 'id=' + e.id + (e.type ? ' ' + e.type : '') + (e.reason ? ' ' + e.reason : '') + (e.by ? ' by=' + e.by : '') : (e.reason || e.why || ''));
+    if (e.kind === 'pinch'){
+      Audio.pinch(); buzz([25, 30, 25]); G.hitstopUntil = now + 70; shake(now, 6, 240); burst(e, now);
+      bubble(e.id, PINCH_WORDS[s.stats.pinches % PINCH_WORDS.length], now); log('fx.start', 'pinch', 'id=' + e.id);
+    } else if (e.kind === 'slam'){
+      Audio.slam(); shake(now, 2.5, 140); buzz(12);
+      for (let i = 0; i < 6; i++) G.parts.push({ kind: 'dust', x: CFG.JAMB_R - 4, y: HINGE.y - 10 + FX() * 20, vx: 10 + FX() * 40, vy: (FX() - 0.5) * 50, born: now, until: now + 450, r: 4 + FX() * 4 });
+    } else if (e.kind === 'impatient'){
+      Audio.grumble(); buzz(15); bubble(e.id, e.type === 'sofa' ? 'Разворачивай!' : WAIT_WORDS[s.stats.impatient % WAIT_WORDS.length], now);
+    } else if (e.kind === 'draft'){
+      Audio.draft(); bubble(-1, 'Дует! Закройте дверь!', now, CFG.W / 2, CFG.VIEW_Y0 + 70);
+    } else if (e.kind === 'heart'){ hud(); }
+    else if (e.kind === 'pass'){
+      Audio.pass(s.passed - 1); hud();
+      for (let i = 0; i < 4; i++) G.parts.push({ kind: 'star', x: e.x, y: e.y, vx: (FX() - 0.5) * 60, vy: -30 - FX() * 40, born: now, until: now + 600, r: 3 });
+    } else if (e.kind === 'grab'){ G.grabbed = true; Audio.grab(); }
+    else if (e.kind === 'win'){ Audio.win(); buzz([20, 40, 20]); log('event', 'level.win', 'stars=' + e.hearts + ' t=' + s.t.toFixed(1)); }
+    else if (e.kind === 'lose'){ Audio.lose(); log('event', 'level.lose', e.why); }
+  }
+  s.events.length = 0;
+}
+
+// --- ввод: Pointer Events; палец где угодно держит дверь, вертикальный свайп меняет угол (§3) ---
+const cv = $('cv'), ctx = cv.getContext('2d');
+let scale = 1, offX = 0, offY = 0, cssW = 400, cssH = 640, DPR = 1;
+let ptr = null;                                   // { id, y0, th0 } — захват двери пальцем
+function toWorld(e){ const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left - offX) / scale, y: (e.clientY - r.top - offY) / scale }; }
+cv.addEventListener('pointerdown', (e) => {
+  Audio.init();
+  if (G.screen !== 'game' || !G.s || G.s.over || ptr) return;
+  const p = toWorld(e); ptr = { id: e.pointerId, y0: p.y, th0: G.s.door.theta };
+  G.input = { hold: true, target: G.s.door.theta };
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+});
+cv.addEventListener('pointermove', (e) => {
+  if (!ptr || e.pointerId !== ptr.id) return;
+  const p = toWorld(e);
+  G.input.target = clamp(ptr.th0 + (ptr.y0 - p.y) * CFG.DRAG_DEG, 0, CFG.DOOR_MAX);
+});
+function onUp(e){ if (!ptr || e.pointerId !== ptr.id) return; ptr = null; G.input = { hold: false, target: 0 }; }
+cv.addEventListener('pointerup', onUp); cv.addEventListener('pointercancel', onUp);
+const keyHold = { on: false };
+document.addEventListener('keydown', (e) => {          // дубли на клавиатуру для отладки (§3)
+  if (e.repeat && e.key === ' ') return;
+  if (e.key === ' ' && G.s){ keyHold.on = true; G.input = { hold: true, target: G.s.door.theta }; e.preventDefault(); }
+  if (e.key === 'ArrowUp' && G.s){ G.input = { hold: true, target: clamp((G.input.hold ? G.input.target : G.s.door.theta) + 15, 0, CFG.DOOR_MAX) }; e.preventDefault(); }
+  if (e.key === 'ArrowDown' && G.s){ G.input = { hold: true, target: clamp((G.input.hold ? G.input.target : G.s.door.theta) - 15, 0, CFG.DOOR_MAX) }; e.preventDefault(); }
+  if (e.key >= '1' && e.key <= String(LEVELS.length)) startLevel(+e.key - 1);
+  if (e.key === 'r') startLevel(G.s ? G.s.li : 0);
+  if (e.key === 'm') goto('menu');
+  if (e.key === 'b'){ HOLD_DOOR.bot(G.bot ? null : 'smart'); toast(G.bot ? 'Автобот: сильный' : 'Автобот выключен'); }
+  if (e.key === ']'){ G.timeScale = Math.min(4, G.timeScale * 2); toast('Скорость ×' + G.timeScale); }
+  if (e.key === '['){ G.timeScale = Math.max(0.25, G.timeScale / 2); toast('Скорость ×' + G.timeScale); }
+});
+document.addEventListener('keyup', (e) => {
+  if ((e.key === ' ' || e.key === 'ArrowUp' || e.key === 'ArrowDown') && !ptr){ keyHold.on = false; G.input = { hold: false, target: 0 }; }
+});
+$('btn-reset').onclick = () => { log('input', 'button', 'reset'); startLevel(G.s ? G.s.li : 0); };
+$('btn-menu').onclick = () => { log('input', 'button', 'menu'); goto('menu'); };
+$('btn-mute').onclick = () => { G.save.muted = !G.save.muted; save(); hud(); log('input', 'button', 'mute=' + G.save.muted); };
+
+// --- размер: resize + orientationchange + периодический пересчёт (§2); видимая часть мира вписана целиком ---
+function fit(){
+  const r = $('game').getBoundingClientRect(); if (!r.width || !r.height) return;
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  cssW = r.width; cssH = r.height;
+  const vh = CFG.H - CFG.VIEW_Y0;
+  scale = Math.min(cssW / CFG.W, cssH / vh); offX = (cssW - CFG.W * scale) / 2; offY = (cssH - vh * scale) / 2 - CFG.VIEW_Y0 * scale;
+  const w = Math.round(cssW * DPR), h = Math.round(cssH * DPR);
+  if (cv.width !== w || cv.height !== h){ cv.width = w; cv.height = h; }
+}
+let fitTimer = 0;
+const refit = () => { clearTimeout(fitTimer); fitTimer = setTimeout(fit, 140); };
+window.addEventListener('resize', refit); window.addEventListener('orientationchange', refit);
+setInterval(fit, 800);
+document.addEventListener('visibilitychange', () => { G.paused = document.hidden; log('event', G.paused ? 'pause' : 'resume'); });
+
+// --- рендер: всё в canvas (§9); каждая функция рисования названа и описана (§11) ---
+// Пол подъезда — плитка в шахматку; наверху слева лифт, справа лестница, у фасада слева почтовые ящики.
+function drawHall(c){
+  const T = 25;
+  for (let y = -400; y < CFG.WALL_Y; y += T) for (let x = 0; x < CFG.W; x += T){
+    c.fillStyle = ((x + y) / T) % 2 === 0 ? ART.hallA : ART.hallB; c.fillRect(x, y, T, T);
+  }
+  c.fillStyle = ART.hallWall; c.fillRect(0, -400, 6, CFG.WALL_Y + 400); c.fillRect(CFG.W - 6, -400, 6, CFG.WALL_Y + 400);
+  // лифт: стальные двери со щелью
+  c.fillStyle = ART.liftDark; c.fillRect(12, -400, 76, 486);
+  c.fillStyle = ART.lift; c.fillRect(17, -400, 66, 480);
+  c.fillStyle = ART.liftDark; c.fillRect(49, -400, 2, 480);
+  // лестница: ступени
+  c.fillStyle = ART.stairs; c.fillRect(230, -400, 84, 500);
+  c.strokeStyle = ART.stairsLine; c.lineWidth = 2;
+  for (let y = 98; y > -400; y -= 10){ c.beginPath(); c.moveTo(230, y); c.lineTo(314, y); c.stroke(); }
+  c.fillStyle = 'rgba(60,40,25,.55)'; c.font = '700 11px system-ui, sans-serif'; c.textAlign = 'center';
+  c.fillText('ЛИФТ', 50, 100); c.fillText('ЛЕСТНИЦА', 272, 116);
+  // почтовые ящики на внутренней стороне фасада
+  for (let i = 0; i < 3; i++){ const x = 10 + i * 26; c.fillStyle = ART.mail; c.fillRect(x, 384, 23, 16); c.fillStyle = ART.mailSlot; c.fillRect(x + 5, 388, 13, 2.5); }
+  c.fillStyle = 'rgba(60,40,25,.55)'; c.font = '700 9px system-ui, sans-serif'; c.fillText('ПОЧТА', 46, 380);
+}
+// Улица: тротуар со снегом, бордюр, асфальт, коврик у двери.
+function drawStreet(c){
+  const y0 = CFG.WALL_Y + CFG.WALL_T;
+  c.fillStyle = ART.sidewalk; c.fillRect(0, y0, CFG.W, 150);
+  c.fillStyle = ART.curb; c.fillRect(0, y0 + 150, CFG.W, 6);
+  c.fillStyle = ART.street; c.fillRect(0, y0 + 156, CFG.W, 800);
+  c.fillStyle = ART.snow;
+  for (const [x, y, w, h] of [[8, 446, 60, 16], [240, 470, 70, 20], [30, 540, 46, 13], [262, 548, 46, 11], [96, 560, 38, 9]]){
+    c.beginPath(); c.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2); c.fill();
+  }
+  c.fillStyle = ART.mat; c.fillRect(CFG.JAMB_L + 8, y0 + 3, DOOR_LEN - 16, 26);
+}
+// Фасад: стена слева и справа от проёма, косяки, петля.
+function drawWall(c){
+  c.fillStyle = ART.wall; c.fillRect(0, CFG.WALL_Y, CFG.JAMB_L, CFG.WALL_T); c.fillRect(CFG.JAMB_R, CFG.WALL_Y, CFG.W - CFG.JAMB_R, CFG.WALL_T);
+  c.fillStyle = ART.wallTop; c.fillRect(0, CFG.WALL_Y, CFG.JAMB_L, 4); c.fillRect(CFG.JAMB_R, CFG.WALL_Y, CFG.W - CFG.JAMB_R, 4);
+  c.fillStyle = ART.hinge; c.beginPath(); c.arc(HINGE.x, HINGE.y, 5, 0, Math.PI * 2); c.fill();
+}
+// Сектор, который заметает дверь: пунктирная дуга; люди внутри него подсвечиваются (drawAgents).
+function drawSweep(c, s){
+  c.save(); c.setLineDash([5, 6]); c.lineWidth = 2; c.strokeStyle = ART.sweep;
+  c.beginPath(); c.arc(HINGE.x, HINGE.y, DOOR_LEN, -CFG.DOOR_MAX * Math.PI / 180, 0); c.stroke();
+  c.restore();
+  // открытая часть проёма — мягкий свет из подъезда на коврик
+  if (s.door.theta > CFG.OPEN_EPS){
+    c.fillStyle = 'rgba(255,230,170,' + Math.min(0.35, s.door.theta / 300) + ')';
+    c.beginPath(); c.moveTo(HINGE.x, HINGE.y); c.arc(HINGE.x, HINGE.y, DOOR_LEN, -s.door.theta * Math.PI / 180, 0); c.closePath(); c.fill();
+  }
+}
+// Полотно двери: доска с кромкой, ручки с обеих сторон, тень. theta — угол открытия, градусы.
+function drawDoor(c, theta){
+  const r = -theta * Math.PI / 180;
+  c.save(); c.translate(HINGE.x, HINGE.y); c.rotate(r);
+  c.fillStyle = 'rgba(0,0,0,.18)'; c.fillRect(2, -CFG.DOOR_HALF + 3, DOOR_LEN, CFG.DOOR_HALF * 2);
+  c.fillStyle = ART.doorEdge; c.beginPath(); c.roundRect(0, -CFG.DOOR_HALF - 1, DOOR_LEN, CFG.DOOR_HALF * 2 + 2, 3); c.fill();
+  c.fillStyle = ART.door; c.beginPath(); c.roundRect(1, -CFG.DOOR_HALF, DOOR_LEN - 2, CFG.DOOR_HALF * 2, 2.5); c.fill();
+  c.fillStyle = ART.doorLight; c.fillRect(6, -1.2, DOOR_LEN - 14, 2.4);
+  c.fillStyle = ART.handle; c.fillRect(DOOR_LEN - 18, -CFG.DOOR_HALF - 4, 10, 3); c.fillRect(DOOR_LEN - 18, CFG.DOOR_HALF + 1, 10, 3);
+  c.restore();
+}
+// Человек сверху: плечи-эллипс поперёк хода, голова с волосами. (x,y) — центр, (hx,hy) — направление взгляда.
+function drawPerson(c, x, y, hx, hy, coat, hair, w, bob){
+  const ang = Math.atan2(hy, hx);
+  c.save(); c.translate(x, y); c.rotate(ang);
+  c.fillStyle = coat; c.beginPath(); c.ellipse(-1, 0, 6.5, w, 0, 0, Math.PI * 2); c.fill();
+  c.fillStyle = 'rgba(0,0,0,.12)'; c.beginPath(); c.ellipse(-3, 0, 3.5, w * 0.8, 0, 0, Math.PI * 2); c.fill();
+  c.fillStyle = ART.skin; c.beginPath(); c.arc(1.5 + bob, 0, 5.2, 0, Math.PI * 2); c.fill();
+  c.fillStyle = hair; c.beginPath(); c.arc(0.2 + bob, 0, 5.2, Math.PI * 0.5, Math.PI * 1.5); c.fill();
+  c.restore();
+}
+// Жилец по типу: сосед, бабушка, курьер, с пакетами, коляска, велосипед, диван с двумя грузчиками.
+function drawAgent(c, a, now, danger){
+  const coat = ART.coats[a.id % ART.coats.length], hair = ART.hair[a.id % ART.hair.length];
+  const bob = Math.sin(a.walked * 0.25) * 0.8;
+  const stunned = G.s.t < a.stunUntil;
+  const wob = stunned ? Math.sin(now / 40) * 2.5 : 0;
+  const hx = a.hx, hy = a.hy, px = a.px + wob, py = a.py;
+  if (danger){ c.strokeStyle = ART.danger; c.lineWidth = 2; c.beginPath();
+    if (a.T.len > 0){ c.lineCap = 'round'; c.lineWidth = a.T.r * 2 + 4; c.globalAlpha = 0.28; c.strokeStyle = ART.danger; c.moveTo(a.px, a.py); c.lineTo(a.qx, a.qy); c.stroke(); c.globalAlpha = 1; c.lineCap = 'butt'; }
+    else { c.arc(a.px, a.py, a.T.r + 3, 0, Math.PI * 2); c.stroke(); } }
+  if (a.type === 'sofa'){
+    const ang = Math.atan2(a.py - a.qy, a.px - a.qx), L = a.T.len;
+    c.save(); c.translate(a.qx + wob, a.qy); c.rotate(ang);
+    c.fillStyle = ART.sofaEdge; c.beginPath(); c.roundRect(-2, -a.T.r, L + 4, a.T.r * 2, 6); c.fill();
+    c.fillStyle = ART.sofa; c.beginPath(); c.roundRect(6, -a.T.r + 5, L - 12, a.T.r * 2 - 5, 4); c.fill();
+    c.fillStyle = ART.sofaCushion; for (let i = 0; i < 3; i++){ c.beginPath(); c.roundRect(10 + i * (L - 20) / 3, -a.T.r + 8, (L - 20) / 3 - 4, a.T.r * 2 - 14, 3); c.fill(); }
+    c.restore();
+    drawPerson(c, a.px + Math.cos(ang) * 4, a.py + Math.sin(ang) * 4, hx, hy, ART.coats[1], ART.hair[0], 9, bob);
+    drawPerson(c, a.qx - Math.cos(ang) * 4, a.qy - Math.sin(ang) * 4, Math.cos(ang), Math.sin(ang), ART.coats[2], ART.hair[2], 9, -bob);
+  } else if (a.type === 'stroller'){
+    const ang = Math.atan2(a.py - a.qy, a.px - a.qx), dx = Math.cos(ang), dy = Math.sin(ang);
+    c.save(); c.translate(a.px + wob, a.py); c.rotate(ang);
+    c.fillStyle = ART.wheel; c.fillRect(-22, -12, 6, 3); c.fillRect(-22, 9, 6, 3); c.fillRect(-4, -12, 6, 3); c.fillRect(-4, 9, 6, 3);
+    c.fillStyle = ART.stroller; c.beginPath(); c.roundRect(-24, -10, 26, 20, 5); c.fill();
+    c.fillStyle = ART.strollerHood; c.beginPath(); c.arc(-4, 0, 10, -Math.PI / 2, Math.PI / 2); c.fill();
+    c.strokeStyle = ART.wheel; c.lineWidth = 2; c.beginPath(); c.moveTo(-24, -7); c.lineTo(-30, -7); c.moveTo(-24, 7); c.lineTo(-30, 7); c.stroke();
+    c.restore();
+    drawPerson(c, a.qx + dx * 2, a.qy + dy * 2, dx, dy, coat, hair, 10, bob);
+  } else if (a.type === 'bike'){
+    const ang = Math.atan2(a.py - a.qy, a.px - a.qx), dx = Math.cos(ang), dy = Math.sin(ang);
+    c.save(); c.translate(a.px + wob, a.py); c.rotate(ang);
+    c.fillStyle = ART.wheel; c.beginPath(); c.roundRect(-9, -2.5, 16, 5, 2.5); c.fill(); c.beginPath(); c.roundRect(-46, -2.5, 16, 5, 2.5); c.fill();
+    c.strokeStyle = ART.bikeFrame; c.lineWidth = 3; c.beginPath(); c.moveTo(-38, 0); c.lineTo(-1, 0); c.stroke();
+    c.strokeStyle = ART.wheel; c.lineWidth = 2.5; c.beginPath(); c.moveTo(-3, -8); c.lineTo(-3, 8); c.stroke();
+    c.restore();
+    drawPerson(c, a.qx + dx * 6 - dy * 9, a.qy + dy * 6 + dx * 9, dx, dy, coat, hair, 9, bob);
+  } else {
+    if (a.type === 'bags'){
+      c.save(); c.translate(px, py); c.rotate(Math.atan2(hy, hx));
+      c.fillStyle = ART.bagEdge; c.fillRect(-5, -17, 10, 7); c.fillRect(-5, 10, 10, 7);
+      c.fillStyle = ART.bag; c.fillRect(-4, -16, 8, 5); c.fillRect(-4, 11, 8, 5);
+      c.restore();
+    }
+    if (a.type === 'courier'){
+      c.save(); c.translate(px, py); c.rotate(Math.atan2(hy, hx));
+      c.fillStyle = ART.courierBox; c.fillRect(-14, -8, 9, 16); c.restore();
+    }
+    drawPerson(c, px, py, hx, hy, a.type === 'granny' ? ART.granny : coat, a.type === 'granny' ? ART.scarf : hair, a.type === 'bags' ? 10 : 9.5, bob);
+  }
+  if (stunned){                                   // звёздочки над головой
+    for (let i = 0; i < 3; i++){ const k = now / 160 + i * 2.1; drawStar(c, a.px + Math.cos(k) * 10, a.py - 4 + Math.sin(k) * 5, 2.6, ART.star); }
+  }
+  if (a.wait > 1.2 && !stunned){                  // кольцо терпения: заполняется к потере сердца
+    const f = a.wait / CFG.PATIENCE;
+    c.lineWidth = 3; c.strokeStyle = 'rgba(0,0,0,.25)'; c.beginPath(); c.arc(a.px, a.py - 20, 6, 0, Math.PI * 2); c.stroke();
+    c.strokeStyle = f > 0.66 ? '#e8463c' : '#f2b33d'; c.beginPath(); c.arc(a.px, a.py - 20, 6, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2); c.stroke();
+  }
+}
+function drawStar(c, x, y, r, color){
+  c.fillStyle = color; c.beginPath();
+  for (let i = 0; i < 8; i++){ const rr = i % 2 ? r * 0.45 : r, a = i * Math.PI / 4; c.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+  c.closePath(); c.fill();
+}
+// Реплика: белое облачко с текстом над жильцом (или в фиксированной точке, если жильца уже нет).
+function drawBubble(c, b, now){
+  const a = b.id >= 0 ? agentById(b.id) : null;
+  const x = a ? a.px : b.x, y = a ? a.py - 30 : b.y;
+  if (x === undefined) return;
+  const k = Math.min(1, (now - b.born) / 120);
+  c.font = '700 13px system-ui, sans-serif'; c.textAlign = 'center';
+  const w = c.measureText(b.text).width + 14, bx = clamp(x, w / 2 + 4, CFG.W - w / 2 - 4);
+  c.save(); c.translate(bx, y); c.scale(0.8 + 0.2 * k, 0.8 + 0.2 * k);
+  c.fillStyle = ART.bubble; c.strokeStyle = 'rgba(0,0,0,.25)'; c.lineWidth = 1;
+  c.beginPath(); c.roundRect(-w / 2, -12, w, 22, 9); c.fill(); c.stroke();
+  c.fillStyle = ART.bubbleInk; c.fillText(b.text, 0, 4);
+  c.restore();
+}
+// Частицы: снег сквозняком в проём, пыль от хлопка, рассыпанные фрукты, звёздочки.
+function stepParts(now, dt){
+  const s = G.s;
+  if (s && G.screen === 'game' && s.door.theta > CFG.OPEN_EPS && !G.paused){
+    G.lastSnow += dt * 50 * Math.min(1.6, s.door.theta / 90);
+    const ex = doorEnd(s.door.theta).x;
+    while (G.lastSnow >= 1){
+      G.lastSnow -= 1;
+      const x0 = Math.max(CFG.JAMB_L + 6, Math.min(ex, CFG.JAMB_R - 8));
+      G.parts.push({ kind: 'snow', x: x0 + FX() * (CFG.JAMB_R - x0), y: CFG.WALL_Y + CFG.WALL_T + 4, vx: (FX() - 0.5) * 30, vy: -50 - FX() * 60, born: now, until: now + 1300 + FX() * 600, r: 1.2 + FX() * 1.6 });
+    }
+  }
+  for (const p of G.parts){
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.kind === 'apple'){ p.vx *= Math.pow(0.12, dt); p.vy *= Math.pow(0.12, dt); }
+    if (p.kind === 'star'){ p.vy += 120 * dt; }
+    if (p.kind === 'snow'){ p.vx += Math.sin((now + p.born) / 300) * 20 * dt; p.vy *= Math.pow(0.6, dt); }
+  }
+  G.parts = G.parts.filter(p => p.until > now);
+  if (G.parts.length > 400) G.parts.splice(0, G.parts.length - 400);
+}
+function drawParts(c, now){
+  for (const p of G.parts){
+    const life = 1 - (now - p.born) / (p.until - p.born);
+    c.globalAlpha = Math.max(0, Math.min(1, life * 1.5));
+    if (p.kind === 'snow'){ c.fillStyle = ART.snow; c.beginPath(); c.arc(p.x, p.y, p.r, 0, Math.PI * 2); c.fill(); }
+    else if (p.kind === 'dust'){ c.fillStyle = 'rgba(120,100,85,.5)'; c.beginPath(); c.arc(p.x, p.y, p.r * (1.5 - life * 0.5), 0, Math.PI * 2); c.fill(); }
+    else if (p.kind === 'apple'){ c.fillStyle = p.color; c.beginPath(); c.arc(p.x, p.y, p.r, 0, Math.PI * 2); c.fill(); }
+    else if (p.kind === 'star') drawStar(c, p.x, p.y, p.r, ART.star);
+  }
+  c.globalAlpha = 1;
+}
+// Подсказка первого уровня: рука, которая зажимает и тянет вверх, пока игрок ни разу не взялся за дверь.
+function drawHandHint(c, now){
+  const k = (now % 1600) / 1600, y = 580 - Math.min(1, k * 1.6) * 90, x = 262;
+  c.globalAlpha = 0.9;
+  c.strokeStyle = 'rgba(255,255,255,.7)'; c.lineWidth = 3; c.setLineDash([4, 6]);
+  c.beginPath(); c.moveTo(x, 584); c.lineTo(x, 494); c.stroke(); c.setLineDash([]);
+  c.fillStyle = '#ffffff'; c.beginPath(); c.arc(x, y, 13, 0, Math.PI * 2); c.fill();
+  c.fillStyle = ART.hint; c.beginPath(); c.arc(x, y, 8, 0, Math.PI * 2); c.fill();
+  c.fillStyle = '#ffffff'; c.font = '700 13px system-ui, sans-serif'; c.textAlign = 'center';
+  c.fillText('держи и веди вверх', x - 30, 612);
+  c.globalAlpha = 1;
+}
+let lastRender = performance.now();
+function render(now){
+  const dt = Math.min(0.05, (now - lastRender) / 1000); lastRender = now;
+  stepParts(now, dt);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = ART.street; ctx.fillRect(0, 0, cssW, cssH);
+  let sx = 0, sy = 0;
+  if (now < G.shake.until){ const k = (G.shake.until - now) / G.shake.dur; sx = (FX() * 2 - 1) * G.shake.amp * k; sy = (FX() * 2 - 1) * G.shake.amp * k; }
+  ctx.setTransform(DPR * scale, 0, 0, DPR * scale, DPR * (offX + sx), DPR * (offY + sy));
+  drawHall(ctx); drawStreet(ctx);
+  const s = G.s;
+  if (s){
+    drawSweep(ctx, s);
+    const ag = s.agents.slice().sort((a, b) => a.py - b.py);
+    for (const a of ag){
+      drawAgent(ctx, a, now, inSweep(a));
+    }
+    drawWall(ctx); drawDoor(ctx, s.door.theta);
+    drawParts(ctx, now);
+    G.bubbles = G.bubbles.filter(b => b.until > now);
+    for (const b of G.bubbles) drawBubble(ctx, b, now);
+    if (s.li === 0 && !G.grabbed && G.screen === 'game') drawHandHint(ctx, now);
+    Audio.setCreak(G.screen === 'game' && !s.over ? s.door.omega : 0);
+    hud();
+  } else { drawWall(ctx); drawDoor(ctx, 0); }
+  if (toastUntil && now > toastUntil){ $('toast').classList.add('hide'); toastUntil = 0; }
+}
+
+// --- цикл: rAF + watchdog; физика фиксированным шагом с аккумулятором (§4) ---
+function simStep(){
+  let inp = G.input;
+  if (G.bot){ if (G.s.t >= G.botNext - 1e-9){ G.botInp = BOTS[G.bot](G.s, G.botMem); G.botNext = G.s.t + BOT.PERIOD; } inp = G.botInp; }
+  step(G.s, inp, CFG.STEP);
+}
+function tick(){
+  const now = performance.now(), dt = Math.min(0.1, (now - G.last) / 1000); G.last = now;
+  if (G.s && G.screen === 'game' && !G.paused && !G.s.over && now >= G.hitstopUntil){
+    G.acc += dt * G.timeScale; let n = 0;
+    while (G.acc >= CFG.STEP && n < CFG.MAX_SUBSTEPS && !G.s.over){ simStep(); G.acc -= CFG.STEP; n++; }
+    if (n >= CFG.MAX_SUBSTEPS) G.acc = 0;
+  }
+  if (G.s){ drainEvents(now); if (G.s.over && !G.endAt && G.screen === 'game') G.endAt = now + 900; }
+  if (G.endAt && now >= G.endAt) finish();
+  render(now);
+}
+let lastFrame = 0;
+function frame(){ lastFrame = performance.now(); tick(); requestAnimationFrame(frame); }
+setInterval(() => { if (performance.now() - lastFrame > 120) tick(); }, 40);
+
+// --- дебаг-хук (§6): состояние, любой экран, прогон времени, автобот ---
+window.HOLD_DOOR = {
+  G, CFG, LEVELS,
+  state(){
+    const s = G.s; if (!s) return { screen: G.screen };
+    return { level: s.li + 1, t: +s.t.toFixed(2), theta: +s.door.theta.toFixed(1), held: s.door.held, hearts: s.hearts, warm: +s.warm.toFixed(2),
+      passed: s.passed, total: s.total, over: s.over, why: s.why, screen: G.screen, stats: s.stats,
+      agents: s.agents.map(a => ({ id: a.id, type: a.type, state: a.state, x: Math.round(a.px), y: Math.round(a.py), wait: +a.wait.toFixed(1) })) };
+  },
+  play(n){ startLevel(clamp((n || 1) - 1, 0, LEVELS.length - 1)); return this.state(); },
+  hold(target){ G.input = { hold: true, target: target === undefined ? G.s.door.theta : target }; return this.state(); },
+  release(){ G.input = { hold: false, target: 0 }; return this.state(); },
+  bot(name){ G.bot = name || null; G.botMem = { rnd: mulberry32(7) }; G.botNext = G.s ? G.s.t : 0; return G.bot; },
+  goto(screen){ goto(screen); return G.screen; },
+  drive(sec){                                   // ручной прогон игрового времени: rAF заморожен в скрытой вкладке
+    const n = Math.round(sec / CFG.STEP);
+    for (let i = 0; i < n && G.s && !G.s.over; i++) simStep();
+    const now = performance.now(); drainEvents(now); if (G.s.over && !G.endAt) G.endAt = now; tick();
+    return this.state();
+  },
+  run(level, bot, seed){ const r = runBot((level || 1) - 1, bot || 'smart', seed); delete r.log; return r; },
+  speed(x){ G.timeScale = x || 1; return G.timeScale; },
+  reset(){ try { localStorage.removeItem(SAVE_KEY); } catch (e) {} location.reload(); },
+};
+
+// --- старт ---
+fit(); hud();
+const startHash = location.hash.slice(1);
+if (startHash === 'game') startLevel(G.save.level); else goto(startHash || 'menu');
+requestAnimationFrame(frame);
+log('event', 'boot', 'levels=' + LEVELS.length);
+</script>
+</body>
+</html>
